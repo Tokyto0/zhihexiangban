@@ -1,0 +1,11 @@
+# 项目文档与竞赛附件仅作为本地参考，不纳入 Git 仓库
+*.md
+*.markdown
+*.pdf
+*.txt
+*.doc
+*.docx
+*.rtf
+*.odt
+*.ppt
+*.pptx
