@@ -1,0 +1,26 @@
+services:
+  api:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      MODEL_PROVIDER: mock
+      EXTERNAL_LLM_ALLOWED: "false"
+      MVP_STORE_PATH: /app/data/mvp_store.json
+    command: python backend/run.py
+    ports:
+      - "8000:8000"
+  web:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - /app/node_modules
+    command: sh -c "npm install --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api

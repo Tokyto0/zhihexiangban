@@ -1,0 +1,50 @@
+{
+  "version": "seed-v1",
+  "cases": [
+    {
+      "case": "brand",
+      "input": "D:\\whc\\Desktop\\第八届AIC算法大赛\\data\\seeds\\examples\\brand\\input.md",
+      "expected": {
+        "case": "brand",
+        "min_entities": 5,
+        "min_evidence": 2,
+        "min_findings": 2,
+        "right_types": [
+          "trademark",
+          "copyright",
+          "geographical_indication"
+        ]
+      }
+    },
+    {
+      "case": "intangible-culture",
+      "input": "D:\\whc\\Desktop\\第八届AIC算法大赛\\data\\seeds\\examples\\intangible-culture\\input.md",
+      "expected": {
+        "case": "intangible-culture",
+        "min_entities": 5,
+        "min_evidence": 2,
+        "min_findings": 2,
+        "right_types": [
+          "trademark",
+          "copyright",
+          "geographical_indication"
+        ]
+      }
+    },
+    {
+      "case": "tourism-event",
+      "input": "D:\\whc\\Desktop\\第八届AIC算法大赛\\data\\seeds\\examples\\tourism-event\\input.md",
+      "expected": {
+        "case": "tourism-event",
+        "min_entities": 5,
+        "min_evidence": 2,
+        "min_findings": 2,
+        "right_types": [
+          "trademark",
+          "copyright",
+          "geographical_indication"
+        ]
+      }
+    }
+  ]
+}

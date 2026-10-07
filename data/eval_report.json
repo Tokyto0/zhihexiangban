@@ -1,0 +1,26 @@
+{
+  "knowledge_base_version": "seed-v1",
+  "results": [
+    {
+      "case": "brand",
+      "entities": 5,
+      "rights": 3,
+      "findings": 2,
+      "evidence_coverage": true
+    },
+    {
+      "case": "intangible-culture",
+      "entities": 5,
+      "rights": 3,
+      "findings": 2,
+      "evidence_coverage": true
+    },
+    {
+      "case": "tourism-event",
+      "entities": 5,
+      "rights": 3,
+      "findings": 2,
+      "evidence_coverage": true
+    }
+  ]
+}
