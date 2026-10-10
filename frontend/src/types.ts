@@ -62,6 +62,28 @@ export interface Evidence {
   limits?: string[]
 }
 
+export interface SearchResult {
+  id: string
+  title: string
+  kind: string
+  region: string
+  match: string
+  source: string
+  evidenceId?: string
+  evidence?: Evidence
+}
+
+export interface QaAnswer {
+  answer: string
+  nextSteps: string[]
+  evidenceIds: string[]
+  provider?: 'mock' | 'deepseek' | string
+  modelVersion?: string
+  knowledgeBaseVersion?: string
+  generatedAt?: string
+  disclaimer?: string
+}
+
 export interface AnalysisResult {
   summary: string
   provider?: 'mock' | 'deepseek' | string

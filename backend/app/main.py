@@ -247,18 +247,18 @@ def enforce_budget(project_id: str, estimated: float) -> None:
         raise ApiError(402, "BUDGET_EXCEEDED", "DeepSeek 调用超过当前预算闸门", {"estimated_cost": estimated, "request_budget": request_limit, "project_cost": usage_cost(project_id=project_id), "project_budget": project_limit, "daily_cost": usage_cost(period="day"), "daily_budget": daily_limit, "monthly_cost": usage_cost(period="month"), "monthly_budget": monthly_limit})
 
 
-def record_usage(project_id: str, request_id_value: str, usage: dict[str, Any], estimated_cost_value: float, status: str, error_code: str | None = None) -> dict[str, Any]:
+def record_usage(project_id: str, request_id_value: str, usage: dict[str, Any], estimated_cost_value: float, status: str, error_code: str | None = None, operation: str = "analysis") -> dict[str, Any]:
     prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
     completion_tokens = int(usage.get("completion_tokens", 0) or 0)
     cached_tokens = int(usage.get("cached_tokens", usage.get("prompt_cache_hit_tokens", 0)) or 0)
     total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
     actual = estimate_cost(prompt_tokens, completion_tokens) if status == "succeeded" else 0.0
-    record = {"id": new_id("usage"), "request_id": request_id_value, "project_id": project_id, "operation": "analysis", "provider": "deepseek", "model_requested": DEEPSEEK_MODEL, "model_served": usage.get("model", DEEPSEEK_MODEL), "status": status, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "cached_tokens": cached_tokens, "total_tokens": total_tokens, "estimated_cost": estimated_cost_value, "actual_cost": actual, "currency": "CNY", "pricing_version": price_config()["version"], "error_code": error_code, "created_at": now_iso()}
+    record = {"id": new_id("usage"), "request_id": request_id_value, "project_id": project_id, "operation": operation, "provider": "deepseek", "model_requested": DEEPSEEK_MODEL, "model_served": usage.get("model", DEEPSEEK_MODEL), "status": status, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "cached_tokens": cached_tokens, "total_tokens": total_tokens, "estimated_cost": estimated_cost_value, "actual_cost": actual, "currency": "CNY", "pricing_version": price_config()["version"], "error_code": error_code, "created_at": now_iso()}
     STORE.put("usage", record["id"], record)
     return record
 
 
-def deepseek_json(messages: list[dict[str, str]], project_id: str, request_id_value: str, max_tokens: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+def deepseek_json(messages: list[dict[str, str]], project_id: str, request_id_value: str, max_tokens: int | None = None, operation: str = "analysis") -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         raise ApiError(503, "PROVIDER_NOT_CONFIGURED", "DeepSeek provider 未配置 API Key，请仅在后端环境变量中设置 DEEPSEEK_API_KEY")
@@ -287,10 +287,10 @@ def deepseek_json(messages: list[dict[str, str]], project_id: str, request_id_va
             code = "PROVIDER_UNAVAILABLE"
         else:
             code = "PROVIDER_REQUEST_ERROR"
-        record_usage(project_id, request_id_value, {}, estimated, "failed", code)
+        record_usage(project_id, request_id_value, {}, estimated, "failed", code, operation)
         raise ApiError(502, code, "DeepSeek 请求失败，请检查 provider 状态和预算配置") from exc
     except (URLError, TimeoutError, OSError) as exc:
-        record_usage(project_id, request_id_value, {}, estimated, "failed", "PROVIDER_NETWORK_ERROR")
+        record_usage(project_id, request_id_value, {}, estimated, "failed", "PROVIDER_NETWORK_ERROR", operation)
         raise ApiError(502, "PROVIDER_NETWORK_ERROR", "无法连接 DeepSeek，请检查网络和 endpoint 配置") from exc
     try:
         response_payload = json.loads(raw.decode("utf-8"))
@@ -299,11 +299,11 @@ def deepseek_json(messages: list[dict[str, str]], project_id: str, request_id_va
         if not isinstance(result, dict):
             raise ValueError("JSON result is not an object")
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
-        record_usage(project_id, request_id_value, {}, estimated, "failed", "PROVIDER_INVALID_JSON")
+        record_usage(project_id, request_id_value, {}, estimated, "failed", "PROVIDER_INVALID_JSON", operation)
         raise ApiError(502, "PROVIDER_INVALID_JSON", "DeepSeek 返回的 JSON 结果无法解析") from exc
     usage = response_payload.get("usage") if isinstance(response_payload.get("usage"), dict) else {}
     usage = {**usage, "model": response_payload.get("model", DEEPSEEK_MODEL)}
-    record_usage(project_id, request_id_value, usage, estimated, "succeeded")
+    record_usage(project_id, request_id_value, usage, estimated, "succeeded", operation=operation)
     return result, usage
 
 
@@ -509,6 +509,74 @@ def build_deepseek_analysis(project: dict[str, Any], assets: Iterable[dict[str, 
         normalized_findings = fallback["findings"]
     missing = raw.get("missing_information") if isinstance(raw.get("missing_information"), list) else fallback["missing_information"]
     return {"summary": as_text(raw.get("summary"), fallback["summary"]), "entities": normalized_entities, "right_candidates": normalized_rights, "sources": [source], "findings": normalized_findings, "missing_information": [as_text(item) for item in missing if as_text(item)], "model_version": usage.get("model", DEEPSEEK_MODEL), "knowledge_base_version": KB_VERSION, "generated_at": now_iso(), "provider": "deepseek", "disclaimer": DISCLAIMER}
+
+
+def analysis_for_project(project: dict[str, Any]) -> dict[str, Any]:
+    analysis = project.get("analysis")
+    if isinstance(analysis, dict) and analysis.get("sources") is not None:
+        return analysis
+    assets = [asset for asset in STORE.values("assets") if asset.get("project_id") == project["id"]]
+    return build_analysis(project, assets)
+
+
+def build_search_results(project: dict[str, Any], analysis: dict[str, Any], query: str) -> list[dict[str, Any]]:
+    """Search only the project's saved evidence and analysis records.
+
+    This deliberately stays local in the MVP: a search hit is never presented as
+    a live official lookup unless a future retrieval connector supplies a source
+    record with its own URL and verification status.
+    """
+
+    normalized_query = as_text(query).casefold()
+    query_terms = split_keywords(normalized_query)
+    candidates: list[dict[str, Any]] = []
+    sources = analysis.get("sources", []) if isinstance(analysis.get("sources"), list) else []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        haystack = " ".join(as_text(source.get(key)) for key in ("title", "publisher", "excerpt", "reason", "url")).casefold()
+        matched_terms = [term for term in query_terms if term.casefold() in haystack]
+        if normalized_query and not matched_terms and normalized_query not in haystack:
+            continue
+        candidates.append({
+            "id": f"search-{source.get('id', new_id('hit'))}",
+            "title": as_text(source.get("title"), f"{project.get('name', '项目')} 来源片段"),
+            "kind": as_text(source.get("source_type"), "project_material"),
+            "region": as_text(project.get("region"), "待补充"),
+            "match": "、".join(matched_terms) if matched_terms else "项目证据记录",
+            "source": as_text(source.get("publisher"), "当前项目材料"),
+            "evidence_id": as_text(source.get("id")),
+            "evidence": source,
+        })
+    if not candidates and not normalized_query:
+        return candidates
+    return candidates[:30]
+
+
+def build_mock_qa(project: dict[str, Any], analysis: dict[str, Any], question: str) -> dict[str, Any]:
+    source_ids = [as_text(item.get("id")) for item in analysis.get("sources", []) if isinstance(item, dict) and as_text(item.get("id"))]
+    question_text = as_text(question)
+    author_related = any(term in question_text for term in ("作者", "授权", "版权", "凭证", "来源"))
+    if author_related:
+        answer = "当前案卷还不能确认作者、授权范围或完整来源链。现有证据只支持把它们列为待补材料。"
+        next_steps = ["补充素材作者、创作时间和来源", "上传许可证、授权合同或授权声明", "再用官方来源核对公开发布范围"]
+    else:
+        answer = f"关于“{question_text}”，当前案卷可以提供初步线索，但不能单独证明正式权利或已完成官方核验。"
+        next_steps = ["查看关联来源档案页", "确认命中的名称、地域和素材是否属于本项目", "对高风险条目留下人工复核结论"]
+    return {"answer": answer, "next_steps": next_steps, "evidence_ids": source_ids[:5], "provider": "mock", "model_version": MODEL_VERSION, "knowledge_base_version": KB_VERSION, "generated_at": now_iso(), "disclaimer": DISCLAIMER}
+
+
+def build_deepseek_qa(project: dict[str, Any], analysis: dict[str, Any], question: str, request_id_value: str) -> dict[str, Any]:
+    source_rows = [{"id": as_text(item.get("id")), "title": sanitize_external_text(item.get("title")), "publisher": sanitize_external_text(item.get("publisher")), "excerpt": sanitize_external_text(item.get("excerpt"))} for item in analysis.get("sources", []) if isinstance(item, dict)]
+    schema = '{"answer":"string","next_steps":["string"],"evidence_ids":["string"]}'
+    system_prompt = "你是农文旅知识产权档案助手。只根据给定的脱敏项目字段和来源档案回答问题，不得把线索说成法律结论。必须输出 JSON，不要输出 Markdown 或 reasoning_content。evidence_ids 只能使用给定来源 id。"
+    payload = {"project": {"name": sanitize_external_text(project.get("name")), "region": sanitize_external_text(project.get("region")), "category": sanitize_external_text(project.get("category"))}, "question": sanitize_external_text(question), "sources": source_rows, "json_schema_example": schema}
+    raw, usage = deepseek_json([{"role": "system", "content": system_prompt}, {"role": "user", "content": "请回答以下问题，必须输出 JSON。\n" + json.dumps(payload, ensure_ascii=False)}], project["id"], request_id_value, max_tokens=600, operation="qa")
+    allowed_ids = {row["id"] for row in source_rows}
+    evidence_ids = [as_text(item) for item in raw.get("evidence_ids", []) if as_text(item) in allowed_ids] if isinstance(raw.get("evidence_ids"), list) else []
+    next_steps = [as_text(item) for item in raw.get("next_steps", []) if as_text(item)][:6] if isinstance(raw.get("next_steps"), list) else []
+    fallback = build_mock_qa(project, analysis, question)
+    return {"answer": as_text(raw.get("answer"), fallback["answer"]), "next_steps": next_steps or fallback["next_steps"], "evidence_ids": evidence_ids or fallback["evidence_ids"], "provider": "deepseek", "model_version": usage.get("model", DEEPSEEK_MODEL), "knowledge_base_version": KB_VERSION, "generated_at": now_iso(), "disclaimer": DISCLAIMER}
 
 
 def build_report(project: dict[str, Any], analysis: dict[str, Any], report_id: str) -> dict[str, Any]:
@@ -894,6 +962,31 @@ class Handler(BaseHTTPRequestHandler):
             if len(segments) >= 4 and segments[:3] == ["api", "v1", "projects"]:
                 project_id = segments[3]
                 project = get_project(project_id)
+                if len(segments) == 5 and segments[4] == "search":
+                    payload = self._json_body()
+                    query = as_text(payload.get("query"))
+                    if len(query) > 200:
+                        raise ApiError(422, "VALIDATION_ERROR", "检索词不能超过 200 个字符", {"field": "query"})
+                    analysis = analysis_for_project(project)
+                    items = build_search_results(project, analysis, query)
+                    self._send(200, {"items": items, "total": len(items), "provider": "mock-search", "knowledge_base_version": KB_VERSION, "request_id": req_id})
+                    return
+                if len(segments) == 5 and segments[4] == "qa":
+                    payload = self._json_body()
+                    question = as_text(payload.get("question"))
+                    if not question:
+                        raise ApiError(422, "VALIDATION_ERROR", "问题不能为空", {"field": "question"})
+                    if len(question) > 1000:
+                        raise ApiError(422, "VALIDATION_ERROR", "问题不能超过 1000 个字符", {"field": "question"})
+                    analysis = analysis_for_project(project)
+                    if provider_name() == "deepseek":
+                        if not external_consent_granted(project):
+                            raise ApiError(403, "EXTERNAL_CONSENT_REQUIRED", "当前项目未同意将脱敏字段发送到 DeepSeek，请先完成项目级同意")
+                        answer = build_deepseek_qa(project, analysis, question, req_id)
+                    else:
+                        answer = build_mock_qa(project, analysis, question)
+                    self._send(200, {**answer, "request_id": req_id})
+                    return
                 if len(segments) == 5 and segments[4] == "analysis":
                     payload = self._json_body()
                     right_types = payload.get("right_types", list(SUPPORTED_RIGHT_TYPES))

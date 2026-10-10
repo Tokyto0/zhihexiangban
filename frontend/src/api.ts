@@ -1,4 +1,4 @@
-import type { AnalysisResult, Asset, Entity, Evidence, Finding, Project, Report, TaskState } from './types'
+import type { AnalysisResult, Asset, Entity, Evidence, Finding, Project, QaAnswer, Report, SearchResult, TaskState } from './types'
 
 type ApiRecord = Record<string, any>
 
@@ -144,6 +144,32 @@ function mapAnalysis(raw: ApiRecord | null | undefined): AnalysisResult | null {
   }
 }
 
+function mapSearchResult(raw: ApiRecord): SearchResult {
+  return {
+    id: String(raw.id || `search-${Math.random().toString(36).slice(2)}`),
+    title: String(raw.title || '项目来源片段'),
+    kind: String(raw.kind || 'project_material'),
+    region: String(raw.region || '待补充'),
+    match: String(raw.match || '项目证据记录'),
+    source: String(raw.source || '当前项目材料'),
+    evidenceId: raw.evidence_id ? String(raw.evidence_id) : undefined,
+    evidence: raw.evidence ? mapEvidence(raw.evidence) : undefined,
+  }
+}
+
+function mapQaAnswer(raw: ApiRecord): QaAnswer {
+  return {
+    answer: String(raw.answer || '当前证据不足以回答这个问题。'),
+    nextSteps: Array.isArray(raw.next_steps) ? raw.next_steps.map(String) : [],
+    evidenceIds: Array.isArray(raw.evidence_ids) ? raw.evidence_ids.map(String) : [],
+    provider: raw.provider,
+    modelVersion: raw.model_version,
+    knowledgeBaseVersion: raw.knowledge_base_version,
+    generatedAt: raw.generated_at,
+    disclaimer: raw.disclaimer,
+  }
+}
+
 function mapTask(raw: ApiRecord): TaskState {
   return {
     taskId: String(raw.task_id),
@@ -274,6 +300,13 @@ export const api = {
   },
   async getAnalysis(projectId: string) {
     return mapAnalysis(await request<ApiRecord>(`/projects/${encodeURIComponent(projectId)}/analysis`))
+  },
+  async searchProject(projectId: string, query: string) {
+    const payload = await request<ApiRecord>(`/projects/${encodeURIComponent(projectId)}/search`, { method: 'POST', body: JSON.stringify({ query }) })
+    return { items: itemsOf<ApiRecord>(payload).map(mapSearchResult), total: Number(payload.total || 0), provider: String(payload.provider || 'mock-search'), knowledgeBaseVersion: payload.knowledge_base_version }
+  },
+  async askProject(projectId: string, question: string) {
+    return mapQaAnswer(await request<ApiRecord>(`/projects/${encodeURIComponent(projectId)}/qa`, { method: 'POST', body: JSON.stringify({ question }) }))
   },
   async listEntities(projectId: string) {
     const payload = await request<ApiRecord>(`/projects/${encodeURIComponent(projectId)}/entities?page=1&page_size=100`)
