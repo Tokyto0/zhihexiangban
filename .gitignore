@@ -11,6 +11,9 @@ backend/**/__pycache__/
 data/uploads/
 data/parsed/
 data/exports/
+data/mvp_store.json
+知识库/**/*.docx
+知识库/**/*.pdf
 frontend/dist/
 tsconfig.tsbuildinfo
 %SystemDrive%/

@@ -9,6 +9,10 @@ export interface Project {
   description: string
   status: 'draft' | 'active' | 'archived'
   privacyLevel: 'local_only' | 'external_allowed'
+  externalLlmConsent?: boolean
+  assetsCount?: number
+  createdAt?: string
+  updatedAt?: string
 }
 
 export interface Asset {
@@ -20,6 +24,9 @@ export interface Asset {
   status: 'succeeded' | 'processing' | 'failed' | 'manual_required'
   authorization: '已声明' | '待补充' | '已核验'
   updatedAt: string
+  taskId?: string
+  progress?: number
+  errorMessage?: string
 }
 
 export interface Entity {
@@ -50,4 +57,43 @@ export interface Evidence {
   source: string
   publishedAt: string
   status: 'verified' | 'pending' | 'invalid'
+  accessedAt?: string
+  supports?: string[]
+  limits?: string[]
+}
+
+export interface AnalysisResult {
+  summary: string
+  provider?: 'mock' | 'deepseek' | string
+  entities: Entity[]
+  findings: Finding[]
+  evidence: Evidence[]
+  rightCandidates: Array<{ id: string; rightType: string; reason: string; confidence: number; reviewRequired: boolean }>
+  missingInformation: string[]
+  modelVersion?: string
+  knowledgeBaseVersion?: string
+  generatedAt?: string
+  disclaimer?: string
+}
+
+export interface TaskState {
+  taskId: string
+  projectId?: string
+  type?: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  progress: number
+  stage?: string
+  errorCode?: string | null
+  errorMessage?: string | null
+}
+
+export interface Report {
+  id: string
+  projectId: string
+  version: number
+  content: string
+  modelVersion?: string
+  knowledgeBaseVersion?: string
+  createdAt?: string
+  analysis?: AnalysisResult
 }

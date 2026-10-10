@@ -33,8 +33,8 @@ export const findings: Finding[] = [
 ]
 
 export const evidence: Evidence[] = [
-  { id: 'ev-1', title: '地理标志查询服务 · 查询说明', publisher: '国家知识产权局', excerpt: '地理标志相关权利线索需要结合地域关联、产品质量特色和官方登记信息进行进一步核验。', source: 'cnipa.gov.cn/col/col256/index.html', publishedAt: '2025-08-12', status: 'verified' },
-  { id: 'ev-2', title: '商标审查审理指南（节选）', publisher: '国家知识产权局', excerpt: '判断标志显著性时，应综合考虑标志构成、指定商品或服务以及相关公众的认知。', source: 'cnipa.gov.cn', publishedAt: '2024-11-01', status: 'verified' },
-  { id: 'ev-3', title: '项目材料 · 山野茶席宣传文案', publisher: '当前项目材料', excerpt: '“雨林慢生活，从一席茶开始。”（作者、创作时间待补录）', source: '山野茶席宣传文案.docx · p2', publishedAt: '访问于 2026-10-07', status: 'pending' },
-  { id: 'ev-4', title: '项目材料 · 茶园入口标识', publisher: '当前项目材料', excerpt: '文件元数据：JPG，1.1 MB。来源备注：项目现场拍摄。', source: '茶园入口标识.jpg', publishedAt: '访问于 2026-10-07', status: 'pending' },
+  { id: 'ev-1', title: '地理标志查询服务 · 查询说明', publisher: '国家知识产权局', excerpt: '地理标志相关权利线索需要结合地域关联、产品质量特色和官方登记信息进行进一步核验。', source: 'cnipa.gov.cn/col/col256/index.html', publishedAt: '2025-08-12', accessedAt: '2026-10-07 10:42', status: 'verified', supports: ['地域关联是进一步核验的必要线索', '项目可整理质量特征与官方来源'], limits: ['不能证明当前项目已经获得地理标志保护', '不能替代官方登记或专业判断'] },
+  { id: 'ev-2', title: '商标审查审理指南（节选）', publisher: '国家知识产权局', excerpt: '判断标志显著性时，应综合考虑标志构成、指定商品或服务以及相关公众的认知。', source: 'cnipa.gov.cn', publishedAt: '2024-11-01', accessedAt: '2026-10-07 10:42', status: 'verified', supports: ['需要结合指定商品或服务类别检索', '标志构成与公众认知是核验维度'], limits: ['不能证明名称可注册或必然冲突'] },
+  { id: 'ev-3', title: '项目材料 · 山野茶席宣传文案', publisher: '当前项目材料', excerpt: '“雨林慢生活，从一席茶开始。”（作者、创作时间待补录）', source: '山野茶席宣传文案.docx · p2', publishedAt: '项目材料', accessedAt: '2026-10-07 10:38', status: 'pending', supports: ['当前项目确实使用了这句宣传语'], limits: ['不能证明作者、创作时间或授权范围'] },
+  { id: 'ev-4', title: '项目材料 · 茶园入口标识', publisher: '当前项目材料', excerpt: '文件元数据：JPG，1.1 MB。来源备注：项目现场拍摄。', source: '茶园入口标识.jpg', publishedAt: '项目材料', accessedAt: '2026-10-07 10:38', status: 'pending', supports: ['当前项目保存了一份现场标识图片'], limits: ['不能证明摄影者或图形标识的授权状态'] },
 ]

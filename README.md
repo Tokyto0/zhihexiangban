@@ -2,19 +2,19 @@
 
 这是第八届 AIC 算法大赛“AI+开源”方向的 MVP。产品面向农文旅小微经营者，把项目材料整理为要素、知识产权线索、可核验的公开证据、风险初筛和行动清单。
 
-当前版本优先保证本地、离线、可复现的完整演示：前端使用 React + Vite + TypeScript，后端提供无第三方依赖的本地 HTTP API，Mock provider 负责稳定输出。后续可以把 `JsonStore` 替换为 FastAPI + PostgreSQL/pgvector，并在项目明确同意、脱敏和预算通过后接入 DeepSeek Flash。
+当前版本优先保证本地、离线、可复现的完整演示：前端使用 React + Vite + TypeScript，后端提供无第三方依赖的本地 HTTP API，Mock provider 负责稳定输出。DeepSeek Flash 已作为后端可选 provider 接入，只有在项目级外发同意、脱敏检查和预算闸门通过后才会调用。
 
 ## 已完成的 MVP 闭环
 
-- 项目总览：项目状态、四阶段进度、风险摘要和项目内问答入口；
-- 材料库：拖拽/选择上传，显示解析状态、来源和授权缺失；
+- 项目档案首页：项目身份、材料 → 要素 → 证据 → 风险 → 报告纵向进度、优先风险和最近档案条目；
+- 材料库：真实 API 拖拽/选择上传，显示上传进度、解析状态、失败重试、来源和授权缺失；
 - 要素确认：项目、品牌、产品、地点、活动、视觉元素和素材来源可编辑、确认或标记待核验；
 - 分析工作台：商标、版权、地理标志三类线索，Mock 检索与风险规则阶段状态；
 - 检索中心：名称、地域和产品类别线索，显示匹配原因和证据抽屉；
 - 风险清单：风险等级、触发因素、证据和行动建议可人工修改；
 - 报告中心：保留 AI 基线，导出脱敏 Markdown / JSON；
 - 设置与开放：Mock provider、seed-v1、预算和外发控制、第三方资源清单；
-- 后端 API：健康检查、项目 CRUD、材料上传/删除、Mock 分析、任务状态、报告生成与导出。
+- 后端 API：健康检查、项目 CRUD、材料上传/删除、解析任务重试、Mock 分析、要素/风险人工编辑、任务状态、报告生成与导出。
 
 ## 本地启动
 
@@ -25,6 +25,8 @@ Copy-Item .env.example .env
 npm install
 python backend/run.py
 ```
+
+启用 DeepSeek 时，只在本机 `.env` 中设置 `MODEL_PROVIDER=deepseek` 和 `DEEPSEEK_API_KEY`。不要把真实 Key 写入前端、浏览器、日志、报告或 Git。项目还必须在设置中明确开启 `external_allowed` 和项目级外发同意；否则后端会阻断请求并继续使用 Mock。
 
 另开一个终端启动前端：
 
@@ -83,7 +85,8 @@ python scripts/eval_mvp.py
 
 ```text
 frontend/                 # React + Vite + TypeScript 工作区
-  src/App.tsx             # 路由式页面与 Mock 交互
+  src/App.tsx             # 路由式档案页面与后端状态同步
+  src/api.ts              # VITE_API_BASE_URL 可配置的统一 API client
   src/mock.ts             # 固定案例数据
   src/styles.css          # 自然可信型桌面优先视觉系统
 backend/
@@ -98,4 +101,4 @@ scripts/                  # seed、评测、回归和清理脚本
 
 ## 已知限制
 
-当前后端为便于学生团队离线复现而实现的标准库 HTTP API，不依赖 FastAPI、数据库或外部模型；前端 Mock 状态与后端数据暂未做自动同步。下一阶段接入 PostgreSQL/pgvector、文档解析器、真实知识库导入、DeepSeek 预算闸门和 Playwright E2E。
+当前后端为便于学生团队离线复现而实现的标准库 HTTP API，不依赖 FastAPI 或数据库；前端项目、材料、分析和报告已经通过 API 同步并保存到 `data/mvp_store.json`。上传解析仍由本地 Mock 完成，知识库 DOCX/PDF 尚未直接接入。DeepSeek 在线调用已经具备 endpoint 白名单、JSON 输出、外发同意、脱敏、预算和 usage 记录；正式部署仍需重新核验价格和服务条款。

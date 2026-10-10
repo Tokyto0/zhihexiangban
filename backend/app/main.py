@@ -22,6 +22,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,13 +30,37 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
+
+def load_local_env() -> None:
+    """Load simple KEY=value pairs from a local .env without logging values."""
+
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env()
 
 API_PREFIX = "/api/v1"
 DISCLAIMER = "本结果仅用于信息整理和风险初筛，不构成法律意见。"
 KB_VERSION = os.getenv("KNOWLEDGE_BASE_VERSION", "seed-v1")
 MODEL_VERSION = "mock-v1"
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 SUPPORTED_RIGHT_TYPES = ("trademark", "copyright", "geographical_indication")
 SUPPORTED_ASSET_TYPES = {
     "application/pdf",
@@ -117,7 +142,7 @@ class JsonStore:
         default_path = Path(__file__).resolve().parents[2] / "data" / "mvp_store.json"
         self.path = Path(path or os.getenv("MVP_STORE_PATH", str(default_path)))
         self.lock = threading.RLock()
-        self.data: dict[str, Any] = {"projects": {}, "tasks": {}, "reports": {}, "assets": {}}
+        self.data: dict[str, Any] = {"projects": {}, "tasks": {}, "reports": {}, "assets": {}, "usage": {}}
         self._load()
 
     def _load(self) -> None:
@@ -125,8 +150,8 @@ class JsonStore:
             try:
                 self.data = json.loads(self.path.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError, OSError):
-                self.data = {"projects": {}, "tasks": {}, "reports": {}, "assets": {}}
-            for key in ("projects", "tasks", "reports", "assets"):
+                self.data = {"projects": {}, "tasks": {}, "reports": {}, "assets": {}, "usage": {}}
+            for key in ("projects", "tasks", "reports", "assets", "usage"):
                 self.data.setdefault(key, {})
 
     def flush(self) -> None:
@@ -157,6 +182,159 @@ class JsonStore:
 
 
 STORE = JsonStore()
+
+
+def provider_name() -> str:
+    return os.getenv("MODEL_PROVIDER", "mock").strip().lower() or "mock"
+
+
+def external_consent_granted(project: dict[str, Any]) -> bool:
+    return project.get("privacy_level") == "external_allowed" and bool(project.get("external_llm_consent"))
+
+
+def sanitize_external_text(value: Any) -> str:
+    """Remove common personal data and credential-shaped strings before egress."""
+
+    text = as_text(value)
+    text = re.sub(r"sk-[A-Za-z0-9_-]{12,}", "[REDACTED_KEY]", text)
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]", text)
+    text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[REDACTED_PHONE]", text)
+    return text[:4000]
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, (len(text) + 3) // 4)
+
+
+def price_config() -> dict[str, Any]:
+    return {
+        "version": os.getenv("DEEPSEEK_PRICING_VERSION", "2026-10-06-reference"),
+        "input_per_million": float(os.getenv("DEEPSEEK_INPUT_CNY_PER_MILLION", "1")),
+        "output_per_million": float(os.getenv("DEEPSEEK_OUTPUT_CNY_PER_MILLION", "4")),
+    }
+
+
+def estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    pricing = price_config()
+    return round((prompt_tokens / 1_000_000) * pricing["input_per_million"] + (completion_tokens / 1_000_000) * pricing["output_per_million"], 8)
+
+
+def usage_cost(project_id: str | None = None, period: str | None = None) -> float:
+    records = STORE.values("usage")
+    now = datetime.now(timezone.utc)
+    total = 0.0
+    for record in records:
+        if record.get("status") != "succeeded":
+            continue
+        if project_id and record.get("project_id") != project_id:
+            continue
+        created = as_text(record.get("created_at"))
+        if period and created:
+            if period == "day" and created[:10] != now.strftime("%Y-%m-%d"):
+                continue
+            if period == "month" and created[:7] != now.strftime("%Y-%m"):
+                continue
+        total += float(record.get("actual_cost", record.get("estimated_cost", 0)) or 0)
+    return round(total, 8)
+
+
+def enforce_budget(project_id: str, estimated: float) -> None:
+    request_limit = float(os.getenv("DEEPSEEK_REQUEST_BUDGET_CNY", "0.05"))
+    project_limit = float(os.getenv("DEEPSEEK_PROJECT_BUDGET_CNY", "0.20"))
+    daily_limit = float(os.getenv("DEEPSEEK_DAILY_BUDGET_CNY", "1.00"))
+    monthly_limit = float(os.getenv("DEEPSEEK_MONTHLY_BUDGET_CNY", "20.00"))
+    if estimated > request_limit or estimated + usage_cost(project_id=project_id) > project_limit or estimated + usage_cost(period="day") > daily_limit or estimated + usage_cost(period="month") > monthly_limit:
+        raise ApiError(402, "BUDGET_EXCEEDED", "DeepSeek 调用超过当前预算闸门", {"estimated_cost": estimated, "request_budget": request_limit, "project_cost": usage_cost(project_id=project_id), "project_budget": project_limit, "daily_cost": usage_cost(period="day"), "daily_budget": daily_limit, "monthly_cost": usage_cost(period="month"), "monthly_budget": monthly_limit})
+
+
+def record_usage(project_id: str, request_id_value: str, usage: dict[str, Any], estimated_cost_value: float, status: str, error_code: str | None = None) -> dict[str, Any]:
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    cached_tokens = int(usage.get("cached_tokens", usage.get("prompt_cache_hit_tokens", 0)) or 0)
+    total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+    actual = estimate_cost(prompt_tokens, completion_tokens) if status == "succeeded" else 0.0
+    record = {"id": new_id("usage"), "request_id": request_id_value, "project_id": project_id, "operation": "analysis", "provider": "deepseek", "model_requested": DEEPSEEK_MODEL, "model_served": usage.get("model", DEEPSEEK_MODEL), "status": status, "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "cached_tokens": cached_tokens, "total_tokens": total_tokens, "estimated_cost": estimated_cost_value, "actual_cost": actual, "currency": "CNY", "pricing_version": price_config()["version"], "error_code": error_code, "created_at": now_iso()}
+    STORE.put("usage", record["id"], record)
+    return record
+
+
+def deepseek_json(messages: list[dict[str, str]], project_id: str, request_id_value: str, max_tokens: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        raise ApiError(503, "PROVIDER_NOT_CONFIGURED", "DeepSeek provider 未配置 API Key，请仅在后端环境变量中设置 DEEPSEEK_API_KEY")
+    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" or parsed.hostname != "api.deepseek.com":
+        raise ApiError(500, "PROVIDER_ENDPOINT_BLOCKED", "DeepSeek endpoint 不在允许的安全白名单内")
+    payload_text = json.dumps({"model": DEEPSEEK_MODEL, "messages": messages, "response_format": {"type": "json_object"}, "thinking": {"type": "disabled"}, "reasoning_effort": "none", "max_tokens": max_tokens or int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "1200"))}, ensure_ascii=False)
+    prompt_tokens = estimate_tokens(payload_text)
+    output_limit = max_tokens or int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "1200"))
+    estimated = estimate_cost(prompt_tokens, output_limit)
+    enforce_budget(project_id, estimated)
+    request = Request(f"{base_url}/chat/completions", data=payload_text.encode("utf-8"), headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
+    timeout = float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "45"))
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            code = "PROVIDER_AUTH_ERROR"
+        elif exc.code == 402:
+            code = "PROVIDER_BALANCE_EXHAUSTED"
+        elif exc.code == 429:
+            code = "PROVIDER_RATE_LIMITED"
+        elif exc.code >= 500:
+            code = "PROVIDER_UNAVAILABLE"
+        else:
+            code = "PROVIDER_REQUEST_ERROR"
+        record_usage(project_id, request_id_value, {}, estimated, "failed", code)
+        raise ApiError(502, code, "DeepSeek 请求失败，请检查 provider 状态和预算配置") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        record_usage(project_id, request_id_value, {}, estimated, "failed", "PROVIDER_NETWORK_ERROR")
+        raise ApiError(502, "PROVIDER_NETWORK_ERROR", "无法连接 DeepSeek，请检查网络和 endpoint 配置") from exc
+    try:
+        response_payload = json.loads(raw.decode("utf-8"))
+        message = response_payload["choices"][0]["message"]["content"]
+        result = json.loads(message) if isinstance(message, str) else message
+        if not isinstance(result, dict):
+            raise ValueError("JSON result is not an object")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as exc:
+        record_usage(project_id, request_id_value, {}, estimated, "failed", "PROVIDER_INVALID_JSON")
+        raise ApiError(502, "PROVIDER_INVALID_JSON", "DeepSeek 返回的 JSON 结果无法解析") from exc
+    usage = response_payload.get("usage") if isinstance(response_payload.get("usage"), dict) else {}
+    usage = {**usage, "model": response_payload.get("model", DEEPSEEK_MODEL)}
+    record_usage(project_id, request_id_value, usage, estimated, "succeeded")
+    return result, usage
+
+
+def _complete_asset_parse(task_id: str, asset_id: str, delay_seconds: float = 0.15) -> None:
+    """Finish the local Mock asset parser without blocking the upload request.
+
+    The worker only handles metadata and text parsing in this MVP.  It never
+    sends the uploaded file to an external service.  State is written at both
+    the running and completed phases so a browser polling ``GET /tasks/{id}``
+    can show useful progress even on a local single-user install.
+    """
+
+    task = STORE.get("tasks", task_id)
+    if not task or task.get("status") == "cancelled":
+        return
+    task.update({"status": "running", "progress": 10, "stage": "parsing", "updated_at": now_iso()})
+    STORE.put("tasks", task_id, task)
+    time.sleep(max(0.01, delay_seconds))
+    task = STORE.get("tasks", task_id)
+    asset = STORE.get("assets", asset_id)
+    if not task or not asset or task.get("status") == "cancelled":
+        return
+    asset.update({"parse_status": "succeeded", "parsed_at": now_iso(), "parser_version": "mock-parser-v1", "progress": 100, "error_message": None})
+    task.update({"status": "succeeded", "progress": 100, "stage": "completed", "error_code": None, "error_message": None, "updated_at": now_iso()})
+    STORE.put("assets", asset_id, asset)
+    STORE.put("tasks", task_id, task)
+
+
+def _schedule_asset_parse(task_id: str, asset_id: str) -> None:
+    worker = threading.Thread(target=_complete_asset_parse, args=(task_id, asset_id), name=f"mock-parse-{task_id}", daemon=True)
+    worker.start()
 
 
 def get_project(project_id: str) -> dict[str, Any]:
@@ -255,6 +433,8 @@ def build_analysis(project: dict[str, Any], assets: Iterable[dict[str, Any]] = (
         {
             "id": new_id("finding"),
             "level": "medium",
+            "type": "名称核验",
+            "title": "名称或核心词待核验",
             "trigger": "名称或核心词的近似性尚未完成官方系统核验",
             "evidence_ids": [source["id"]],
             "recommendation": "拆分名称中的核心词、地域词和通用词，并通过官方查询入口做人工复核。",
@@ -264,6 +444,8 @@ def build_analysis(project: dict[str, Any], assets: Iterable[dict[str, Any]] = (
         {
             "id": new_id("finding"),
             "level": "insufficient",
+            "type": "材料完整性",
+            "title": "作者与授权凭证待补录",
             "trigger": "项目材料未提供完整作者、来源和授权凭证字段",
             "evidence_ids": [source["id"]],
             "recommendation": "补充素材作者、来源、时间、许可证和授权凭证，再确认开放或发布范围。",
@@ -283,6 +465,50 @@ def build_analysis(project: dict[str, Any], assets: Iterable[dict[str, Any]] = (
         "generated_at": now_iso(),
         "disclaimer": DISCLAIMER,
     }
+
+
+def build_deepseek_analysis(project: dict[str, Any], assets: Iterable[dict[str, Any]], request_id_value: str) -> dict[str, Any]:
+    """Run the online provider on redacted, structured project metadata only."""
+
+    asset_rows = [{"filename": sanitize_external_text(asset.get("filename")), "mime_type": asset.get("mime_type"), "source_note": sanitize_external_text(asset.get("source_note"))} for asset in assets]
+    source = source_for(project, "project_material", sanitize_external_text("；".join(filter(None, [project.get("name"), project.get("region"), project.get("category"), project.get("description")])),), "DeepSeek 仅依据经过脱敏的项目字段和材料元数据生成候选线索")
+    source["status"] = "pending"
+    schema = '{"summary":"string","entities":[{"type":"string","value":"string","confidence":0.0,"review_status":"unreviewed"}],"right_candidates":[{"right_type":"trademark|copyright|geographical_indication","reason":"string","confidence":0.0,"review_required":true}],"findings":[{"level":"high|medium|low|insufficient","type":"string","title":"string","trigger":"string","recommendation":"string","status":"open","review_required":true}],"missing_information":["string"]}'
+    system_prompt = "你是农文旅知识产权档案助手。只做信息整理和风险初筛，不给出可注册、已确权或法律确定性结论。请严格输出 JSON，不要输出 Markdown 或 reasoning_content。所有 finding 的 evidence_ids 必须只使用给定的 source_id。"
+    user_payload = {"project": {"name": sanitize_external_text(project.get("name")), "region": sanitize_external_text(project.get("region")), "category": sanitize_external_text(project.get("category")), "description": sanitize_external_text(project.get("description"))}, "assets": asset_rows, "source_id": source["id"], "json_schema_example": schema}
+    raw, usage = deepseek_json([{"role": "system", "content": system_prompt}, {"role": "user", "content": "请根据以下脱敏 JSON 生成结构化初筛结果。必须输出 JSON。\n" + json.dumps(user_payload, ensure_ascii=False)}], project["id"], request_id_value)
+    fallback = build_analysis(project, assets)
+    def confidence_value(value: Any) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.5
+
+    entities = raw.get("entities") if isinstance(raw.get("entities"), list) else fallback["entities"]
+    normalized_entities = []
+    for item in entities[:20]:
+        if not isinstance(item, dict) or not as_text(item.get("value")):
+            continue
+        normalized_entities.append({"id": new_id("entity"), "type": as_text(item.get("type"), "待分类"), "value": as_text(item.get("value"))[:160], "source_chunk_id": source["id"], "confidence": confidence_value(item.get("confidence", 0.5) or 0.5), "review_status": as_text(item.get("review_status"), "unreviewed")})
+    if not normalized_entities:
+        normalized_entities = fallback["entities"]
+    rights = raw.get("right_candidates") if isinstance(raw.get("right_candidates"), list) else fallback["right_candidates"]
+    normalized_rights = [{"id": new_id("right"), "right_type": as_text(item.get("right_type")), "reason": as_text(item.get("reason")), "confidence": confidence_value(item.get("confidence", 0.5) or 0.5), "review_required": bool(item.get("review_required", True))} for item in rights if isinstance(item, dict) and as_text(item.get("right_type")) in SUPPORTED_RIGHT_TYPES]
+    if not normalized_rights:
+        normalized_rights = fallback["right_candidates"]
+    findings = raw.get("findings") if isinstance(raw.get("findings"), list) else fallback["findings"]
+    normalized_findings = []
+    for item in findings[:20]:
+        if not isinstance(item, dict):
+            continue
+        level = as_text(item.get("level"), "insufficient")
+        if level not in {"high", "medium", "low", "insufficient"}:
+            level = "insufficient"
+        normalized_findings.append({"id": new_id("finding"), "level": level, "type": as_text(item.get("type"), "待分类"), "title": as_text(item.get("title"), "待核验风险"), "trigger": as_text(item.get("trigger"), "模型未提供触发因素"), "evidence_ids": [source["id"]], "recommendation": as_text(item.get("recommendation"), "补充材料并进行人工核验。"), "status": as_text(item.get("status"), "open"), "review_required": True})
+    if not normalized_findings:
+        normalized_findings = fallback["findings"]
+    missing = raw.get("missing_information") if isinstance(raw.get("missing_information"), list) else fallback["missing_information"]
+    return {"summary": as_text(raw.get("summary"), fallback["summary"]), "entities": normalized_entities, "right_candidates": normalized_rights, "sources": [source], "findings": normalized_findings, "missing_information": [as_text(item) for item in missing if as_text(item)], "model_version": usage.get("model", DEEPSEEK_MODEL), "knowledge_base_version": KB_VERSION, "generated_at": now_iso(), "provider": "deepseek", "disclaimer": DISCLAIMER}
 
 
 def build_report(project: dict[str, Any], analysis: dict[str, Any], report_id: str) -> dict[str, Any]:
@@ -327,6 +553,94 @@ def build_report(project: dict[str, Any], analysis: dict[str, Any], report_id: s
         "created_at": now_iso(),
         "disclaimer": DISCLAIMER,
     }
+
+
+def update_analysis_item(project: dict[str, Any], collection: str, item_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist one human review edit inside a project's analysis."""
+
+    analysis = project.get("analysis")
+    if not isinstance(analysis, dict):
+        raise ApiError(409, "ANALYSIS_NOT_READY", "请先完成项目分析")
+    items = analysis.get(collection)
+    if not isinstance(items, list):
+        raise ApiError(404, "NOT_FOUND", "分析结果不存在")
+    item = next((candidate for candidate in items if candidate.get("id") == item_id), None)
+    if item is None:
+        raise ApiError(404, "NOT_FOUND", "分析项不存在", {"id": item_id})
+
+    if "expected_version" in payload:
+        expected = payload.get("expected_version")
+        if not isinstance(expected, int) or expected < 1:
+            raise ApiError(422, "VALIDATION_ERROR", "expected_version 必须是正整数")
+        actual = int(item.get("version", 1))
+        if expected != actual:
+            raise ApiError(409, "VERSION_CONFLICT", "分析项已被其他修改更新", {"expected_version": expected, "actual_version": actual})
+
+    if collection == "entities":
+        allowed = {"value", "type", "confidence", "review_status", "source_chunk_id", "expected_version"}
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ApiError(422, "VALIDATION_ERROR", "存在不可编辑的实体字段", {"fields": unknown})
+        if "value" in payload:
+            value = as_text(payload.get("value"))
+            if not value:
+                raise ApiError(422, "VALIDATION_ERROR", "实体值不能为空", {"field": "value"})
+            item["value"] = value
+        if "type" in payload:
+            entity_type = as_text(payload.get("type"))
+            if not entity_type:
+                raise ApiError(422, "VALIDATION_ERROR", "实体类型不能为空", {"field": "type"})
+            item["type"] = entity_type
+        if "confidence" in payload:
+            try:
+                confidence = float(payload["confidence"])
+            except (TypeError, ValueError) as exc:
+                raise ApiError(422, "VALIDATION_ERROR", "confidence 必须是数字", {"field": "confidence"}) from exc
+            if not 0 <= confidence <= 1:
+                raise ApiError(422, "VALIDATION_ERROR", "confidence 必须在 0 到 1 之间", {"field": "confidence"})
+            item["confidence"] = confidence
+        if "review_status" in payload:
+            review_status = as_text(payload.get("review_status"))
+            if review_status not in {"unreviewed", "confirmed", "needs_review", "rejected", "待确认", "已确认", "待核验", "已驳回"}:
+                raise ApiError(422, "VALIDATION_ERROR", "review_status 无效", {"field": "review_status"})
+            item["review_status"] = review_status
+        if "source_chunk_id" in payload:
+            item["source_chunk_id"] = payload.get("source_chunk_id") or None
+    else:
+        allowed = {"level", "trigger", "recommendation", "status", "assignee", "review_required", "evidence_ids", "type", "title", "expected_version"}
+        unknown = sorted(set(payload) - allowed)
+        if unknown:
+            raise ApiError(422, "VALIDATION_ERROR", "存在不可编辑的风险项字段", {"fields": unknown})
+        if "level" in payload:
+            level = as_text(payload.get("level"))
+            if level not in {"high", "medium", "low", "insufficient"}:
+                raise ApiError(422, "VALIDATION_ERROR", "风险等级无效", {"field": "level"})
+            item["level"] = level
+        for field in ("trigger", "recommendation", "assignee", "type", "title"):
+            if field in payload:
+                item[field] = as_text(payload.get(field))
+        if "status" in payload:
+            status = as_text(payload.get("status"))
+            if status not in {"open", "confirmed", "rejected", "待处理", "已确认", "已驳回"}:
+                raise ApiError(422, "VALIDATION_ERROR", "风险项状态无效", {"field": "status"})
+            item["status"] = status
+        if "review_required" in payload:
+            if not isinstance(payload["review_required"], bool):
+                raise ApiError(422, "VALIDATION_ERROR", "review_required 必须是布尔值", {"field": "review_required"})
+            item["review_required"] = payload["review_required"]
+        if "evidence_ids" in payload:
+            evidence_ids = payload["evidence_ids"]
+            if not isinstance(evidence_ids, list) or any(not isinstance(value, str) or not value for value in evidence_ids):
+                raise ApiError(422, "VALIDATION_ERROR", "evidence_ids 必须是字符串数组", {"field": "evidence_ids"})
+            item["evidence_ids"] = evidence_ids
+
+    item["version"] = int(item.get("version", 0)) + 1
+    item["updated_at"] = now_iso()
+    analysis["last_reviewed_at"] = item["updated_at"]
+    project["analysis"] = analysis
+    project["updated_at"] = item["updated_at"]
+    STORE.put("projects", project["id"], project)
+    return item
 
 
 def paginate(items: list[dict[str, Any]], query: dict[str, list[str]]) -> dict[str, Any]:
@@ -443,6 +757,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == f"{API_PREFIX}/settings":
                 self._send(200, {"provider": os.getenv("MODEL_PROVIDER", "mock"), "provider_configured": bool(os.getenv("DEEPSEEK_API_KEY")), "external_llm_allowed": os.getenv("EXTERNAL_LLM_ALLOWED", "false").lower() == "true", "knowledge_base_version": KB_VERSION, "request_id": req_id})
                 return
+            if path == f"{API_PREFIX}/usage/summary":
+                project_id = query.get("project_id", [None])[0]
+                self._send(200, {"provider": provider_name(), "project_id": project_id, "project_cost": usage_cost(project_id=project_id) if project_id else None, "daily_cost": usage_cost(period="day"), "monthly_cost": usage_cost(period="month"), "budgets": {"request": float(os.getenv("DEEPSEEK_REQUEST_BUDGET_CNY", "0.05")), "project": float(os.getenv("DEEPSEEK_PROJECT_BUDGET_CNY", "0.20")), "daily": float(os.getenv("DEEPSEEK_DAILY_BUDGET_CNY", "1.00")), "monthly": float(os.getenv("DEEPSEEK_MONTHLY_BUDGET_CNY", "20.00"))}, "request_id": req_id})
+                return
             segments = [segment for segment in path.split("/") if segment]
             if len(segments) >= 4 and segments[:3] == ["api", "v1", "projects"]:
                 project_id = segments[3]
@@ -540,6 +858,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(201, {**project, "request_id": req_id})
                 return
             segments = [segment for segment in path.split("/") if segment]
+            if len(segments) == 5 and segments[:3] == ["api", "v1", "tasks"] and segments[4] == "retry":
+                original_id = segments[3]
+                original = STORE.get("tasks", original_id)
+                if not original:
+                    raise ApiError(404, "NOT_FOUND", "任务不存在")
+                if original.get("status") != "failed":
+                    raise ApiError(409, "TASK_NOT_RETRYABLE", "只有失败任务可以重试", {"status": original.get("status")})
+                if original.get("type") != "asset_parse" or not original.get("asset_id"):
+                    raise ApiError(409, "TASK_NOT_RETRYABLE", "当前 Mock 版本只支持重试材料解析任务")
+                asset = STORE.get("assets", original["asset_id"])
+                if not asset:
+                    raise ApiError(404, "NOT_FOUND", "任务关联的材料不存在")
+                new_task_id = new_id("task")
+                asset.update({"parse_status": "queued", "parse_error": None, "progress": 0, "error_message": None, "task_id": new_task_id})
+                retry_task = {
+                    **original,
+                    "task_id": new_task_id,
+                    "status": "queued",
+                    "progress": 0,
+                    "stage": "queued",
+                    "error_code": None,
+                    "error_message": None,
+                    "request_id": req_id,
+                    "source_task_id": original_id,
+                    "created_at": now_iso(),
+                    "updated_at": now_iso(),
+                }
+                asset["parse_task_id"] = new_task_id
+                STORE.put("assets", asset["id"], asset)
+                STORE.put("tasks", new_task_id, retry_task)
+                _schedule_asset_parse(new_task_id, asset["id"])
+                self._send(202, {"task_id": new_task_id, "status": "queued", "request_id": req_id})
+                return
             if len(segments) >= 4 and segments[:3] == ["api", "v1", "projects"]:
                 project_id = segments[3]
                 project = get_project(project_id)
@@ -549,14 +900,20 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(right_types, list) or any(value not in SUPPORTED_RIGHT_TYPES for value in right_types):
                         raise ApiError(422, "VALIDATION_ERROR", "right_types 只能包含商标、版权和地理标志")
                     assets = [asset for asset in STORE.values("assets") if asset.get("project_id") == project_id]
-                    analysis = build_analysis(project, assets)
+                    if provider_name() == "deepseek":
+                        if not external_consent_granted(project):
+                            raise ApiError(403, "EXTERNAL_CONSENT_REQUIRED", "当前项目未同意将材料元数据发送到 DeepSeek，请先将隐私级别设为 external_allowed 并完成项目级同意")
+                        analysis = build_deepseek_analysis(project, assets, req_id)
+                    else:
+                        analysis = build_analysis(project, assets)
+                        analysis["provider"] = "mock"
                     analysis["right_candidates"] = [item for item in analysis["right_candidates"] if item["right_type"] in right_types]
                     project["analysis"] = analysis
                     project["status"] = "active"
                     project["updated_at"] = now_iso()
                     STORE.put("projects", project_id, project)
                     task_id = new_id("task")
-                    task = {"task_id": task_id, "project_id": project_id, "type": "analysis", "status": "succeeded", "progress": 100, "stage": "completed", "error_code": None, "error_message": None, "request_id": req_id, "result": analysis, "created_at": now_iso(), "updated_at": now_iso()}
+                    task = {"task_id": task_id, "project_id": project_id, "type": "analysis", "status": "succeeded", "progress": 100, "stage": "completed", "error_code": None, "error_message": None, "request_id": req_id, "provider": analysis.get("provider", "mock"), "result": analysis, "created_at": now_iso(), "updated_at": now_iso()}
                     STORE.put("tasks", task_id, task)
                     self._send(202, {"task_id": task_id, "status": "succeeded", "model_version": MODEL_VERSION, "knowledge_base_version": KB_VERSION, "request_id": req_id})
                     return
@@ -611,6 +968,26 @@ class Handler(BaseHTTPRequestHandler):
                 project.update({"privacy_level": privacy, "external_llm_consent": consent, "consent_at": now_iso() if consent else None, "updated_at": now_iso()})
                 STORE.put("projects", project["id"], project)
                 self._send(200, {"id": project["id"], "privacy_level": privacy, "external_llm_consent": consent, "consent_at": project["consent_at"], "request_id": req_id})
+                return
+            if len(segments) == 6 and segments[:3] == ["api", "v1", "projects"] and segments[4] in {"entities", "findings"}:
+                project = get_project(segments[3])
+                payload = self._json_body()
+                collection = segments[4]
+                item = update_analysis_item(project, collection, segments[5], payload)
+                self._send(200, {**item, "request_id": req_id})
+                return
+            if len(segments) == 4 and segments[:3] in (["api", "v1", "entities"], ["api", "v1", "findings"]):
+                collection = segments[2]
+                payload = self._json_body()
+                matching_projects = []
+                for candidate in STORE.values("projects"):
+                    candidate_analysis = candidate.get("analysis") or {}
+                    if any(item.get("id") == segments[3] for item in candidate_analysis.get(collection, [])):
+                        matching_projects.append(candidate["id"])
+                if not matching_projects:
+                    raise ApiError(404, "NOT_FOUND", "分析项不存在", {"id": segments[3]})
+                item = update_analysis_item(get_project(matching_projects[0]), collection, segments[3], payload)
+                self._send(200, {**item, "request_id": req_id})
                 return
             raise ApiError(404, "NOT_FOUND", "接口不存在")
         except ApiError as exc:
@@ -694,14 +1071,18 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(413, "PAYLOAD_TOO_LARGE", "单文件不能超过 20 MB")
         asset_id = new_id("asset")
         digest = hashlib.sha256(content).hexdigest()
-        asset = {"id": asset_id, "project_id": project["id"], "filename": filename, "mime_type": mime_type, "size_bytes": len(content), "sha256": digest, "storage_key": f"{project['id']}/{asset_id}/original", "source_note": source_note, "authorization_status": authorization_status, "parse_status": "succeeded" if mime_type.startswith("text/") else "queued", "created_at": now_iso()}
+        asset = {"id": asset_id, "project_id": project["id"], "filename": filename, "mime_type": mime_type, "size_bytes": len(content), "sha256": digest, "storage_key": f"{project['id']}/{asset_id}/original", "source_note": source_note, "authorization_status": authorization_status, "parse_status": "queued", "parse_error": None, "progress": 0, "error_message": None, "created_at": now_iso()}
         STORE.put("assets", asset_id, asset)
         project["assets_count"] = current_count + 1
         project["updated_at"] = now_iso()
         STORE.put("projects", project["id"], project)
         task_id = new_id("task")
-        task = {"task_id": task_id, "project_id": project["id"], "type": "asset_parse", "status": "succeeded" if mime_type.startswith("text/") else "queued", "progress": 100 if mime_type.startswith("text/") else 0, "stage": "completed" if mime_type.startswith("text/") else "queued", "error_code": None, "error_message": None, "request_id": req_id, "created_at": now_iso(), "updated_at": now_iso()}
+        task = {"task_id": task_id, "project_id": project["id"], "asset_id": asset_id, "type": "asset_parse", "status": "queued", "progress": 0, "stage": "queued", "error_code": None, "error_message": None, "request_id": req_id, "created_at": now_iso(), "updated_at": now_iso()}
+        asset["parse_task_id"] = task_id
+        asset["task_id"] = task_id
+        STORE.put("assets", asset_id, asset)
         STORE.put("tasks", task_id, task)
+        _schedule_asset_parse(task_id, asset_id)
         return {"asset": asset, "task_id": task_id, "request_id": req_id}
 
     def _route(self) -> tuple[str, dict[str, list[str]]]:
