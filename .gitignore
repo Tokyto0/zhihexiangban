@@ -12,6 +12,7 @@ data/uploads/
 data/parsed/
 data/exports/
 data/mvp_store.json
+data/processed/knowledge/
 知识库/**/*.docx
 知识库/**/*.pdf
 frontend/dist/

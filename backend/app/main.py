@@ -61,6 +61,8 @@ DISCLAIMER = "本结果仅用于信息整理和风险初筛，不构成法律意
 KB_VERSION = os.getenv("KNOWLEDGE_BASE_VERSION", "seed-v1")
 MODEL_VERSION = "mock-v1"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
+DEFAULT_KB_PATH = Path(__file__).resolve().parents[2] / "data" / "seeds" / "knowledge" / "seed-v1.jsonl"
+DEFAULT_SOURCE_REGISTRY_PATH = Path(__file__).resolve().parents[2] / "data" / "source_registry" / "sources.jsonl"
 SUPPORTED_RIGHT_TYPES = ("trademark", "copyright", "geographical_indication")
 SUPPORTED_ASSET_TYPES = {
     "application/pdf",
@@ -189,7 +191,15 @@ def provider_name() -> str:
 
 
 def external_consent_granted(project: dict[str, Any]) -> bool:
-    return project.get("privacy_level") == "external_allowed" and bool(project.get("external_llm_consent"))
+    service_allowed = os.getenv("EXTERNAL_LLM_ALLOWED", "false").strip().lower() == "true"
+    return service_allowed and project.get("privacy_level") == "external_allowed" and bool(project.get("external_llm_consent"))
+
+
+def require_external_consent(project: dict[str, Any]) -> None:
+    if os.getenv("EXTERNAL_LLM_ALLOWED", "false").strip().lower() != "true":
+        raise ApiError(403, "EXTERNAL_LLM_DISABLED", "服务端未开启第三方外发，请先在后端环境配置 EXTERNAL_LLM_ALLOWED=true")
+    if project.get("privacy_level") != "external_allowed" or not project.get("external_llm_consent"):
+        raise ApiError(403, "EXTERNAL_CONSENT_REQUIRED", "当前项目未同意将脱敏字段发送到 DeepSeek，请先将隐私级别设为 external_allowed 并完成项目级同意")
 
 
 def sanitize_external_text(value: Any) -> str:
@@ -200,6 +210,66 @@ def sanitize_external_text(value: Any) -> str:
     text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]", text)
     text = re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)", "[REDACTED_PHONE]", text)
     return text[:4000]
+
+
+def load_jsonl_records(path_value: str | Path) -> list[dict[str, Any]]:
+    """Load a bounded JSONL file without logging its contents."""
+
+    try:
+        lines = Path(path_value).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in lines[:20000]:
+        try:
+            value = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
+def load_source_registry() -> dict[str, dict[str, Any]]:
+    registry: dict[str, dict[str, Any]] = {}
+    for record in load_jsonl_records(os.getenv("SOURCE_REGISTRY_PATH", str(DEFAULT_SOURCE_REGISTRY_PATH))):
+        source_id = as_text(record.get("source_id"))
+        if source_id:
+            registry[source_id] = record
+    return registry
+
+
+KNOWLEDGE_ENTRIES = load_jsonl_records(os.getenv("KNOWLEDGE_BASE_PATH", str(DEFAULT_KB_PATH)))
+SOURCE_REGISTRY = load_source_registry()
+
+
+def knowledge_base_sources(project: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project-safe evidence views over the local, versioned JSONL knowledge base."""
+
+    sources: list[dict[str, Any]] = []
+    for entry in KNOWLEDGE_ENTRIES:
+        source_id = as_text(entry.get("source_id") or entry.get("id"))
+        text = sanitize_external_text(entry.get("text") or entry.get("excerpt"))
+        if not source_id or not text:
+            continue
+        registry = SOURCE_REGISTRY.get(source_id, {})
+        sources.append({
+            "id": f"kb-{source_id}",
+            "title": as_text(entry.get("title"), as_text(registry.get("title"), "本地知识库条目")),
+            "publisher": as_text(entry.get("publisher"), as_text(registry.get("publisher"), "本地知识库资料")),
+            "url": as_text(entry.get("url"), as_text(registry.get("url"))),
+            "excerpt": text,
+            "reason": "本地知识库召回，仍需结合来源状态人工核验",
+            "source_type": "knowledge_base",
+            "status": as_text(entry.get("status"), as_text(registry.get("status"), "pending")),
+            "published_at": entry.get("effective_date") or registry.get("published_at"),
+            "retrieved_at": entry.get("retrieved_at") or registry.get("retrieved_at"),
+            "region": as_text(entry.get("region"), as_text(project.get("region"), "中国")),
+            "right_type": as_text(entry.get("right_type"), "unknown"),
+            "page_no": entry.get("page_no"),
+            "knowledge_base_version": KB_VERSION,
+        })
+    return sources
 
 
 def estimate_tokens(text: str) -> int:
@@ -519,6 +589,22 @@ def analysis_for_project(project: dict[str, Any]) -> dict[str, Any]:
     return build_analysis(project, assets)
 
 
+def sources_for_project(project: dict[str, Any], analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    project_sources = [item for item in analysis.get("sources", []) if isinstance(item, dict)] if isinstance(analysis.get("sources"), list) else []
+    known_ids = {as_text(item.get("id")) for item in project_sources if as_text(item.get("id"))}
+    return project_sources + [item for item in knowledge_base_sources(project) if as_text(item.get("id")) not in known_ids]
+
+
+def qa_sources_for_project(project: dict[str, Any], analysis: dict[str, Any], question: str) -> list[dict[str, Any]]:
+    """Keep Q&A egress bounded to the most relevant local evidence rows."""
+
+    hits = build_search_results(project, analysis, question)
+    selected = [item["evidence"] for item in hits if isinstance(item.get("evidence"), dict)]
+    if not selected:
+        selected = sources_for_project(project, analysis)
+    return selected[:6]
+
+
 def build_search_results(project: dict[str, Any], analysis: dict[str, Any], query: str) -> list[dict[str, Any]]:
     """Search only the project's saved evidence and analysis records.
 
@@ -530,23 +616,26 @@ def build_search_results(project: dict[str, Any], analysis: dict[str, Any], quer
     normalized_query = as_text(query).casefold()
     query_terms = split_keywords(normalized_query)
     candidates: list[dict[str, Any]] = []
-    sources = analysis.get("sources", []) if isinstance(analysis.get("sources"), list) else []
+    sources = sources_for_project(project, analysis)
     for source in sources:
         if not isinstance(source, dict):
+            continue
+        source_id = as_text(source.get("id"))
+        if not source_id:
             continue
         haystack = " ".join(as_text(source.get(key)) for key in ("title", "publisher", "excerpt", "reason", "url")).casefold()
         matched_terms = [term for term in query_terms if term.casefold() in haystack]
         if normalized_query and not matched_terms and normalized_query not in haystack:
             continue
         candidates.append({
-            "id": f"search-{source.get('id', new_id('hit'))}",
+            "id": f"search-{source_id}",
             "title": as_text(source.get("title"), f"{project.get('name', '项目')} 来源片段"),
             "kind": as_text(source.get("source_type"), "project_material"),
             "region": as_text(project.get("region"), "待补充"),
             "match": "、".join(matched_terms) if matched_terms else "项目证据记录",
             "source": as_text(source.get("publisher"), "当前项目材料"),
-            "evidence_id": as_text(source.get("id")),
-            "evidence": source,
+            "evidence_id": source_id,
+            "evidence": {**source, "id": source_id, "excerpt": as_text(source.get("excerpt"), "暂无原文摘录。")},
         })
     if not candidates and not normalized_query:
         return candidates
@@ -554,7 +643,7 @@ def build_search_results(project: dict[str, Any], analysis: dict[str, Any], quer
 
 
 def build_mock_qa(project: dict[str, Any], analysis: dict[str, Any], question: str) -> dict[str, Any]:
-    source_ids = [as_text(item.get("id")) for item in analysis.get("sources", []) if isinstance(item, dict) and as_text(item.get("id"))]
+    source_ids = [as_text(item.get("id")) for item in qa_sources_for_project(project, analysis, question) if as_text(item.get("id"))]
     question_text = as_text(question)
     author_related = any(term in question_text for term in ("作者", "授权", "版权", "凭证", "来源"))
     if author_related:
@@ -567,7 +656,7 @@ def build_mock_qa(project: dict[str, Any], analysis: dict[str, Any], question: s
 
 
 def build_deepseek_qa(project: dict[str, Any], analysis: dict[str, Any], question: str, request_id_value: str) -> dict[str, Any]:
-    source_rows = [{"id": as_text(item.get("id")), "title": sanitize_external_text(item.get("title")), "publisher": sanitize_external_text(item.get("publisher")), "excerpt": sanitize_external_text(item.get("excerpt"))} for item in analysis.get("sources", []) if isinstance(item, dict)]
+    source_rows = [{"id": as_text(item.get("id")), "title": sanitize_external_text(item.get("title")), "publisher": sanitize_external_text(item.get("publisher")), "excerpt": sanitize_external_text(item.get("excerpt"))} for item in qa_sources_for_project(project, analysis, question) if isinstance(item, dict)]
     schema = '{"answer":"string","next_steps":["string"],"evidence_ids":["string"]}'
     system_prompt = "你是农文旅知识产权档案助手。只根据给定的脱敏项目字段和来源档案回答问题，不得把线索说成法律结论。必须输出 JSON，不要输出 Markdown 或 reasoning_content。evidence_ids 只能使用给定来源 id。"
     payload = {"project": {"name": sanitize_external_text(project.get("name")), "region": sanitize_external_text(project.get("region")), "category": sanitize_external_text(project.get("category"))}, "question": sanitize_external_text(question), "sources": source_rows, "json_schema_example": schema}
@@ -965,13 +1054,15 @@ class Handler(BaseHTTPRequestHandler):
                 if len(segments) == 5 and segments[4] == "search":
                     payload = self._json_body()
                     query = as_text(payload.get("query"))
+                    if not query:
+                        raise ApiError(422, "VALIDATION_ERROR", "检索词不能为空", {"field": "query"})
                     if len(query) > 200:
                         raise ApiError(422, "VALIDATION_ERROR", "检索词不能超过 200 个字符", {"field": "query"})
                     analysis = analysis_for_project(project)
                     items = build_search_results(project, analysis, query)
                     self._send(200, {"items": items, "total": len(items), "provider": "mock-search", "knowledge_base_version": KB_VERSION, "request_id": req_id})
                     return
-                if len(segments) == 5 and segments[4] == "qa":
+                if len(segments) == 5 and segments[4] in {"ask", "qa"}:
                     payload = self._json_body()
                     question = as_text(payload.get("question"))
                     if not question:
@@ -980,8 +1071,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(422, "VALIDATION_ERROR", "问题不能超过 1000 个字符", {"field": "question"})
                     analysis = analysis_for_project(project)
                     if provider_name() == "deepseek":
-                        if not external_consent_granted(project):
-                            raise ApiError(403, "EXTERNAL_CONSENT_REQUIRED", "当前项目未同意将脱敏字段发送到 DeepSeek，请先完成项目级同意")
+                        require_external_consent(project)
                         answer = build_deepseek_qa(project, analysis, question, req_id)
                     else:
                         answer = build_mock_qa(project, analysis, question)
@@ -994,8 +1084,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise ApiError(422, "VALIDATION_ERROR", "right_types 只能包含商标、版权和地理标志")
                     assets = [asset for asset in STORE.values("assets") if asset.get("project_id") == project_id]
                     if provider_name() == "deepseek":
-                        if not external_consent_granted(project):
-                            raise ApiError(403, "EXTERNAL_CONSENT_REQUIRED", "当前项目未同意将材料元数据发送到 DeepSeek，请先将隐私级别设为 external_allowed 并完成项目级同意")
+                        require_external_consent(project)
                         analysis = build_deepseek_analysis(project, assets, req_id)
                     else:
                         analysis = build_analysis(project, assets)

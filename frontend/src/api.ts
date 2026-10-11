@@ -306,7 +306,7 @@ export const api = {
     return { items: itemsOf<ApiRecord>(payload).map(mapSearchResult), total: Number(payload.total || 0), provider: String(payload.provider || 'mock-search'), knowledgeBaseVersion: payload.knowledge_base_version }
   },
   async askProject(projectId: string, question: string) {
-    return mapQaAnswer(await request<ApiRecord>(`/projects/${encodeURIComponent(projectId)}/qa`, { method: 'POST', body: JSON.stringify({ question }) }))
+    return mapQaAnswer(await request<ApiRecord>(`/projects/${encodeURIComponent(projectId)}/ask`, { method: 'POST', body: JSON.stringify({ question }) }))
   },
   async listEntities(projectId: string) {
     const payload = await request<ApiRecord>(`/projects/${encodeURIComponent(projectId)}/entities?page=1&page_size=100`)

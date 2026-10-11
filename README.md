@@ -14,7 +14,7 @@
 - 风险清单：风险等级、触发因素、证据和行动建议可人工修改；
 - 报告中心：保留 AI 基线，导出脱敏 Markdown / JSON；
 - 设置与开放：Mock provider、seed-v1、预算和外发控制、第三方资源清单；
-- 后端 API：健康检查、项目 CRUD、材料上传/删除、解析任务重试、Mock/DeepSeek 分析、项目级检索与问答、要素/风险人工编辑、任务状态、报告生成与导出。
+- 后端 API：健康检查、项目 CRUD、材料上传/删除、解析任务重试、Mock/DeepSeek 分析、项目级检索与 `/ask` 问答、要素/风险人工编辑、任务状态、报告生成与导出；`/qa` 暂作为兼容别名保留。
 
 ## 本地启动
 
@@ -26,7 +26,7 @@ npm install
 python backend/run.py
 ```
 
-启用 DeepSeek 时，只在本机 `.env` 中设置 `MODEL_PROVIDER=deepseek` 和 `DEEPSEEK_API_KEY`。不要把真实 Key 写入前端、浏览器、日志、报告或 Git。项目还必须在设置中明确开启 `external_allowed` 和项目级外发同意；否则后端会阻断请求并继续使用 Mock。
+启用 DeepSeek 时，只在本机 `.env` 中设置 `MODEL_PROVIDER=deepseek`、`DEEPSEEK_API_KEY` 和服务端总开关 `EXTERNAL_LLM_ALLOWED=true`。不要把真实 Key 写入前端、浏览器、日志、报告或 Git。项目还必须在设置中明确开启 `external_allowed` 和项目级外发同意；否则后端会阻断请求并继续使用 Mock。
 
 另开一个终端启动前端：
 
@@ -59,8 +59,12 @@ PowerShell 也可以直接运行：
 
 ```powershell
 python scripts/test_mvp.py
+python scripts/test_api_contract.py
 python scripts/seed_demo.py
 python scripts/eval_mvp.py
+python scripts/import_knowledge_base.py --version local-v2
+# 仅在明确允许外部调用时执行；默认只发送合成测试字段
+python scripts/test_deepseek_controlled.py --confirm-external
 ```
 
 ## 三个固定案例
@@ -101,4 +105,18 @@ scripts/                  # seed、评测、回归和清理脚本
 
 ## 已知限制
 
-当前后端为便于学生团队离线复现而实现的标准库 HTTP API，不依赖 FastAPI 或数据库；前端项目、材料、分析、检索问答和报告已经通过 API 同步并保存到 `data/mvp_store.json`。项目级检索默认只查询当前案卷的证据记录，不冒充实时官方检索；上传解析仍由本地 Mock 完成，知识库 DOCX/PDF 尚未直接接入。DeepSeek 在线调用已经具备 endpoint 白名单、JSON 输出、外发同意、脱敏、预算和 usage 记录；正式部署仍需重新核验价格和服务条款。
+当前后端为便于学生团队离线复现而实现的标准库 HTTP API，不依赖 FastAPI 或数据库；前端项目、材料、分析、检索问答和报告已经通过 API 同步并保存到 `data/mvp_store.json`。项目级检索默认只查询当前案卷和已配置的本地 JSONL 知识库，不冒充实时官方检索；上传解析仍由本地 Mock 完成，DOCX/PDF 需要通过显式导入脚本整理，导入条目默认保持 `pending_manual_review`。DeepSeek 在线调用已经具备 endpoint 白名单、JSON 输出、外发同意、脱敏、预算和 usage 记录；正式部署仍需重新核验价格和服务条款。
+
+## 本地知识库导入
+
+`scripts/import_knowledge_base.py` 会读取 `知识库/` 下的 DOCX/PDF，提取文本、按约 800 个中文字符分块，并在写入 JSONL 前脱敏 API Key、邮箱、手机号和身份证号。原始文件保持只读，生成的 `data/processed/knowledge/` 不纳入 Git；来源许可状态默认标记为 `pending_manual_review`，不能直接当作公开数据集发布。
+
+导入后，在本机 `.env` 指向生成的快照并重启后端：
+
+```powershell
+KNOWLEDGE_BASE_VERSION=local-v2
+KNOWLEDGE_BASE_PATH=./data/processed/knowledge/knowledge-local-v2.jsonl
+SOURCE_REGISTRY_PATH=./data/processed/knowledge/sources-local-v2.jsonl
+```
+
+项目级检索和问答会将本地知识库条目作为带版本的候选证据；条目仍显示待核验状态，不会被包装成官方结论。
