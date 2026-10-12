@@ -70,11 +70,50 @@ analysis["sources"] = [{
 try:
     answer = main.build_deepseek_qa(project, analysis, "地理标志候选还需要核查哪些证据？", "req-controlled-deepseek")
     usage = main.STORE.values("usage")
+    qa_records = [item for item in usage if item.get("operation") == "qa" and item.get("request_id") == "req-controlled-deepseek"]
+    if answer.get("provider") != "deepseek" or answer.get("prompt_version") != "evidence-answer-v1":
+        raise RuntimeError("受控调用未返回预期 DeepSeek provider/prompt_version")
+    if not answer.get("usage", {}).get("total_tokens"):
+        raise RuntimeError("受控调用未返回有效 usage.total_tokens")
+    if len(qa_records) != 1 or qa_records[0].get("status") != "succeeded":
+        raise RuntimeError("受控调用未形成唯一 succeeded usage 记录")
+    if qa_records[0].get("pricing_version") != answer.get("pricing_version"):
+        raise RuntimeError("usage 记录与响应的 pricing_version 不一致")
+
+    # Verify the user-facing budget hint without making a second provider call.
+    previous_request_budget = os.environ.get("DEEPSEEK_REQUEST_BUDGET_CNY")
+    os.environ["DEEPSEEK_REQUEST_BUDGET_CNY"] = "0"
+    try:
+        try:
+            main.enforce_budget(project["id"], 0.001)
+        except main.ApiError as budget_error:
+            if budget_error.code != "BUDGET_EXCEEDED" or not budget_error.details.get("error_hint"):
+                raise RuntimeError("预算拒绝缺少稳定 error_hint") from budget_error
+            budget_check = {"code": budget_error.code, "error_hint_present": True, "pricing_version": budget_error.details.get("pricing_version"), "state": budget_error.details.get("budget_status", {}).get("state")}
+        else:
+            raise RuntimeError("预算为 0 时未触发 BUDGET_EXCEEDED")
+    finally:
+        if previous_request_budget is None:
+            os.environ.pop("DEEPSEEK_REQUEST_BUDGET_CNY", None)
+        else:
+            os.environ["DEEPSEEK_REQUEST_BUDGET_CNY"] = previous_request_budget
+
     print(json.dumps({
         "ok": True,
         "provider": answer.get("provider"),
         "model_version": answer.get("model_version"),
         "knowledge_base_version": answer.get("knowledge_base_version"),
+        "usage": {
+            "prompt_tokens": answer.get("usage", {}).get("prompt_tokens"),
+            "completion_tokens": answer.get("usage", {}).get("completion_tokens"),
+            "total_tokens": answer.get("usage", {}).get("total_tokens"),
+        },
+        "estimated_cost": answer.get("estimated_cost"),
+        "actual_cost": answer.get("actual_cost"),
+        "pricing_version": answer.get("pricing_version"),
+        "budget_state": answer.get("budget_status", {}).get("state"),
+        "budget_error_check": budget_check,
+        "evidence_coverage": answer.get("evidence_coverage"),
         "evidence_count": len(answer.get("evidence_ids", [])),
         "usage_records": len(usage),
         "usage_statuses": sorted({str(item.get("status")) for item in usage}),

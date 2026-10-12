@@ -73,10 +73,58 @@ export interface SearchResult {
   evidence?: Evidence
 }
 
+export interface QaUsage {
+  promptTokens: number
+  completionTokens: number
+  cachedTokens: number
+  totalTokens: number
+}
+
+export interface QaCost {
+  estimated: number
+  actual: number
+  currency: string
+  pricingVersion: string
+}
+
+export interface QaBudgetStatus {
+  state: 'ok' | 'exceeded' | 'not_applicable' | string
+  allowed: boolean
+  estimatedCost: number
+  spent: { request: number; project: number; daily: number; monthly: number }
+  limits: { request: number; project: number; daily: number; monthly: number }
+  remaining: { request: number; project: number; daily: number; monthly: number }
+}
+
+export interface QaEvidenceCoverage {
+  state: 'pass' | 'insufficient' | 'failed' | string
+  factsTotal: number
+  factsCited: number
+  assessmentTotal: number
+  assessmentCited: number
+  allowedEvidenceIds: string[]
+  invalidItems?: number
+}
+
 export interface QaAnswer {
   answer: string
   nextSteps: string[]
   evidenceIds: string[]
+  sources?: Evidence[]
+  facts?: Array<{ statement: string; evidenceIds: string[] }>
+  assessment?: Array<{ statement: string; confidence: number; evidenceIds: string[]; reviewRequired: boolean }>
+  uncertainties?: string[]
+  expertiseScope?: string
+  intent?: string
+  usage?: QaUsage
+  cost?: QaCost
+  estimatedCost?: number
+  actualCost?: number
+  currency?: string
+  pricingVersion?: string
+  promptVersion?: string
+  budgetStatus?: QaBudgetStatus
+  evidenceCoverage?: QaEvidenceCoverage
   provider?: 'mock' | 'deepseek' | string
   modelVersion?: string
   knowledgeBaseVersion?: string
